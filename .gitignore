@@ -1,0 +1,6 @@
+transcripts/
+__pycache__/
+.venv/
+local.env
+once_processed.png
+*.jpg
