@@ -72,7 +72,7 @@ async function tick() {
   try {
     const s = await (await fetch("/api/state")).json();
     const st = s.stats;
-    $("stats").textContent = `backend=${st.backend} | ${st.status} | snapshots=${st.snapshots} | skipped(unchanged)=${st.skipped} | frame diff ${st.last_diff ?? "-"} | last OCR ${st.last_latency ?? "-"}s | cam ${st.cam_fps} fps | transcript: ${st.transcript}`;
+    $("stats").textContent = `backend=${st.backend} | ${st.status} | snapshots=${st.snapshots} | skipped(unchanged)=${st.skipped} | frame diff ${st.last_diff ?? "-"} | last OCR ${st.last_latency ?? "-"}s | pages ${st.pages_billed} (~$${st.est_cost}) | cam ${st.cam_fps} fps | transcript: ${st.transcript}`;
     $("proc").src = "/processed.jpg?" + Date.now();
     if (!settingsLoaded) {
       $("bw").checked = s.settings.bw; $("invert").checked = s.settings.invert;

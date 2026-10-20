@@ -1,87 +1,81 @@
-# BoardMath (barebones demo)
+# BoardMath (barebones demo), Datalab API branch
 
-Live handwritten whiteboard math → LaTeX, using [Chandra OCR](https://github.com/datalab-to/chandra).
+Live handwritten whiteboard math → LaTeX. This branch runs [Chandra OCR](https://github.com/datalab-to/chandra) through the **hosted Datalab API**, so nothing runs locally and there's no model download or GPU needed. The `main` branch runs Chandra locally instead.
 
 ```
-camera (OpenCV) ─► latest frame ─► preprocess ─► changed? ─► Chandra ─► LaTeX ─► web page + transcript
-                                   gray, contrast/     (skip if the
-                                   brightness, CLAHE,   board hasn't
+camera (OpenCV) ─► latest frame ─► preprocess ─► changed? ─► Datalab /convert (Chandra) ─► LaTeX ─► web page + transcript
+                                   gray, contrast/     (skip if the        submit, then poll
+                                   brightness, CLAHE,   board hasn't        request_check_url
                                    B&W threshold,       changed)
                                    resize
 ```
 
-- The OCR runs back-to-back with one request in flight, so frames are processed as fast as the model allows. Use `--interval` to set a minimum gap between requests.
-- Frames whose 160 px thumbnail differs from the last OCR'd frame by less than `--diff-threshold` are skipped.
-- The page shows the live feed, the exact preprocessed frame sent to OCR, the raw LaTeX/markdown, and that output rendered with KaTeX. KaTeX also emits MathML, which screen readers can read.
+- One API request is in flight at a time. `--interval` (default 2.5 s) keeps you under the free tier's 25 requests/min.
+- Frames whose 160 px thumbnail differs from the last OCR'd frame by less than `--diff-threshold` are skipped, so an unchanged board isn't billed.
+- The page shows the live feed, the exact preprocessed frame that was uploaded, the raw LaTeX/markdown, and that output rendered with KaTeX. KaTeX also emits MathML, which screen readers can read. The page also shows pages billed and an estimated cost.
 - Every unique equation goes into a clickable lecture history, so you can navigate back.
 - Every snapshot is appended to `transcripts/lecture_<timestamp>.md`.
 
-## Setup (Apple silicon Mac, e.g. M5 / 24 GB)
+## Cost
+
+Datalab bills each uploaded frame as one page:
+
+| `--mode` | Price | Notes |
+|---|---|---|
+| `fast` | $4 / 1,000 pages | lowest latency |
+| `balanced` (default) | $4 / 1,000 pages | recommended |
+| `accurate` | $10 / 1,000 pages | try it if balanced misreads handwriting |
+
+A 75-minute lecture is roughly 450–1,500 frames, so about $2–6 in balanced mode. The free plan includes $10/month on a personal email ($20 on a work email). These are list prices from datalab.to/pricing as of October 2026.
+
+## Setup
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+export DATALAB_API_KEY=...        # from datalab.to; or put DATALAB_API_KEY=... in local.env
 ```
-
-The first `hf` run downloads `datalab-to/chandra-ocr-2`, which is about 10 GB at BF16. The weights are not part of this repo, and they are under a modified OpenRAIL-M license (see the Chandra repo).
 
 macOS asks for camera permission for your terminal app on the first run. Allow it under System Settings → Privacy & Security → Camera, then rerun.
 
 ## Run
 
-Check the model on one photo first:
+Check the API on one photo first:
 
 ```bash
-python app.py --once board_photo.jpg --backend hf
+python app.py --once board_photo.jpg
 ```
 
-This prints the markdown and the extracted equations, and writes `once_processed.png` so you can see exactly what the model saw.
+This prints the markdown and the extracted equations, and writes `once_processed.png` so you can see exactly what was uploaded.
 
 Then start the live demo:
 
 ```bash
-python app.py --backend hf --camera 0
+python app.py --camera 0
 # open http://127.0.0.1:8000
 ```
 
-### Backends
-
-| `--backend` | What it does | Speed |
-|---|---|---|
-| `hf` (default) | Chandra via transformers on MPS (`TORCH_DEVICE=mps` set automatically) | slowest; zero extra setup |
-| `server` | Chandra's `vllm` client pointed at any OpenAI-compatible server | fastest on a Mac with an MLX quant |
-| `mock` | canned LaTeX, ~1 s fake latency | for testing camera/UI without the model |
-
-**Faster option: an MLX quant served by LM Studio**
-
-1. In LM Studio, download an MLX build of the model, e.g. `mlx-community/chandra-ocr-2-oQ8`, or a 4-bit or 8-bit variant such as `1qh/chandra-ocr-2-4bit-mlx`.
-2. Load the model and start the local server (Developer tab). It listens on `http://localhost:1234/v1` by default.
-3. Run:
-   ```bash
-   python app.py --backend server --api-base http://localhost:1234/v1 --model-name <model id shown in LM Studio>
-   ```
-   `mlx_vlm.server` or a real vLLM box (the "MEC" in the full design) works the same way. Point `--api-base` at it.
-
-Chandra's own prompt (`ocr_layout`) and output parsers are used for every backend.
+`--backend mock` returns canned LaTeX without calling the API, which is free and good for testing the camera and UI.
 
 ### Useful flags
 
 | Flag | Default | Notes |
 |---|---|---|
+| `--mode` | `balanced` | `fast` / `balanced` / `accurate` |
 | `--camera` | `0` | camera index, or a video file / stream URL (video files loop) |
-| `--interval` | `0` | minimum seconds between OCR calls |
-| `--diff-threshold` | `4.0` | lower = re-OCR on smaller changes |
+| `--interval` | `2.5` | minimum seconds between API calls |
+| `--diff-threshold` | `4.0` | lower = re-OCR on smaller changes (more pages billed) |
 | `--alpha` / `--beta` | `1.3` / `10` | contrast gain / brightness offset |
 | `--no-bw` | off | skip the adaptive B&W threshold (sometimes better for the model) |
 | `--invert` | off | for chalk on blackboard |
-| `--max-side` | `1600` | resize long edge before OCR |
-| `--max-tokens` | `2048` | max output tokens per frame |
+| `--max-side` | `1600` | resize long edge before upload |
+| `--timeout` | `60` | give up on one request after N seconds |
 
 B&W, invert, interval and diff threshold can also be changed live from the page.
 
 ## Files
 
-- `app.py`: capture thread, OCR worker thread, preprocessing, Chandra backends, FastAPI server
+- `app.py`: capture thread, OCR worker thread, preprocessing, Datalab client, FastAPI server
 - `static/index.html`: the page (polls `/api/state` every second)
 
 ## Not in this demo

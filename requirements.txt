@@ -3,4 +3,4 @@ uvicorn
 opencv-python
 numpy
 pillow
-chandra-ocr[hf]
+requests

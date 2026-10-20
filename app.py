@@ -1,9 +1,10 @@
-"""BoardMath: barebones live whiteboard -> LaTeX demo using Chandra OCR.
+"""BoardMath: barebones live whiteboard -> LaTeX demo using Chandra via the Datalab API.
 
-camera -> latest frame -> preprocess -> change check -> Chandra -> LaTeX -> web page
+camera -> latest frame -> preprocess -> change check -> Datalab (Chandra) -> LaTeX -> web page
 """
 
 import argparse
+import io
 import os
 import re
 import sys
@@ -14,19 +15,24 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import requests
 from PIL import Image
 
 ROOT = Path(__file__).parent
+DATALAB_URL = "https://www.datalab.to/api/v1/convert"
 
 # ---------------------------------------------------------------- args
 
 p = argparse.ArgumentParser(description="BoardMath live demo")
-p.add_argument("--backend", choices=["hf", "server", "mock"], default="hf",
-               help="hf = Chandra via transformers (MPS on Mac); server = Chandra via an "
-                    "OpenAI-compatible server (LM Studio / mlx_vlm / vLLM); mock = canned output")
+p.add_argument("--backend", choices=["datalab", "mock"], default="datalab",
+               help="datalab = hosted Chandra via the Datalab API (needs DATALAB_API_KEY); "
+                    "mock = canned output")
+p.add_argument("--mode", choices=["fast", "balanced", "accurate"], default="balanced",
+               help="Datalab mode: fast/balanced = $4 per 1k pages, accurate = $10 per 1k pages")
 p.add_argument("--camera", default="0", help="camera index or video file/URL")
-p.add_argument("--interval", type=float, default=0.0,
-               help="min seconds between OCR calls (0 = back-to-back, as fast as the model allows)")
+p.add_argument("--interval", type=float, default=2.5,
+               help="min seconds between OCR calls (default 2.5 keeps under the free tier's "
+                    "25 requests/min; 0 = back-to-back)")
 p.add_argument("--diff-threshold", type=float, default=4.0,
                help="mean abs pixel diff (0-255) needed to re-OCR; lower = more sensitive")
 p.add_argument("--alpha", type=float, default=1.3, help="contrast gain")
@@ -34,11 +40,7 @@ p.add_argument("--beta", type=float, default=10, help="brightness offset")
 p.add_argument("--no-bw", dest="bw", action="store_false", help="skip adaptive threshold to B&W")
 p.add_argument("--invert", action="store_true", help="invert (chalk on blackboard)")
 p.add_argument("--max-side", type=int, default=1600, help="resize long side before OCR")
-p.add_argument("--max-tokens", type=int, default=2048, help="max output tokens per frame")
-p.add_argument("--api-base", default=os.environ.get("VLLM_API_BASE", "http://localhost:1234/v1"),
-               help="server backend: OpenAI-compatible base URL")
-p.add_argument("--model-name", default=os.environ.get("VLLM_MODEL_NAME"),
-               help="server backend: model id (default: first model the server lists)")
+p.add_argument("--timeout", type=float, default=60, help="give up on one API request after N s")
 p.add_argument("--host", default="127.0.0.1")
 p.add_argument("--port", type=int, default=8000)
 p.add_argument("--once", metavar="IMAGE", help="OCR a single image, print result, exit")
@@ -56,6 +58,8 @@ state = {
     "snap_count": 0,
     "skipped": 0,
     "last_diff": None,
+    "pages_billed": 0,
+    "est_cost": 0.0,
     "last_latency": None,
     "cam_fps": 0.0,
     "status": "starting",
@@ -121,36 +125,58 @@ class MockOCR:
         return md, md
 
 
-class ChandraOCR:
-    def __init__(self, backend):
-        # chandra reads its settings from env at import time
-        if backend == "hf":
-            try:
-                import torch
-                if torch.backends.mps.is_available():
-                    os.environ.setdefault("TORCH_DEVICE", "mps")
-            except ImportError:
-                pass
-        else:
-            os.environ["VLLM_API_BASE"] = args.api_base
-            if args.model_name:
-                os.environ["VLLM_MODEL_NAME"] = args.model_name
-        os.environ.setdefault("MAX_OUTPUT_TOKENS", str(args.max_tokens))
-        from chandra.model import InferenceManager
-        from chandra.model.schema import BatchInputItem
-        self.Item = BatchInputItem
-        print(f"[ocr] loading chandra ({backend}) ...", flush=True)
-        self.mgr = InferenceManager(method="hf" if backend == "hf" else "vllm")
-        print("[ocr] ready", flush=True)
+class DatalabOCR:
+    """Submit to /convert, then poll request_check_url until complete."""
+
+    PRICE_PER_PAGE = {"fast": 0.004, "balanced": 0.004, "accurate": 0.010}
+
+    def __init__(self):
+        key = os.environ.get("DATALAB_API_KEY")
+        if not key and (ROOT / "local.env").exists():
+            for line in (ROOT / "local.env").read_text().splitlines():
+                if line.startswith("DATALAB_API_KEY="):
+                    key = line.split("=", 1)[1].strip()
+        if not key:
+            sys.exit("set DATALAB_API_KEY (env var or local.env) or use --backend mock")
+        self.s = requests.Session()
+        self.s.headers["X-API-Key"] = key
 
     def __call__(self, pil):
-        kw = {"max_output_tokens": args.max_tokens}
-        if args.backend == "server":
-            kw["vllm_api_base"] = args.api_base
-        out = self.mgr.generate([self.Item(image=pil, prompt_type="ocr_layout")], **kw)[0]
-        if out.error:
-            raise RuntimeError("chandra returned error")
-        return out.markdown, out.raw
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        r = self.s.post(
+            DATALAB_URL,
+            files={"file": ("board.png", buf.getvalue(), "image/png")},
+            data={"output_format": "markdown", "mode": args.mode,
+                  "disable_image_extraction": "true"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        sub = r.json()
+        if sub.get("success") is False:
+            raise RuntimeError(sub.get("error") or "submit failed")
+        check_url = sub["request_check_url"]
+        deadline = time.time() + args.timeout
+        while True:
+            time.sleep(0.5)
+            res = self.s.get(check_url, timeout=30)
+            res.raise_for_status()
+            res = res.json()
+            if res.get("status") == "complete":
+                break
+            if time.time() > deadline:
+                raise RuntimeError(f"timed out after {args.timeout}s")
+        if not res.get("success", True):
+            raise RuntimeError(res.get("error") or "conversion failed")
+        if res.get("markdown") is None and res.get("result_url"):
+            # result_url is self-authorizing: don't send the API key there
+            res = requests.get(res["result_url"], timeout=30).json()
+        pages = res.get("page_count") or 1
+        with lock:
+            state["pages_billed"] += pages
+            state["est_cost"] += pages * self.PRICE_PER_PAGE[args.mode]
+        md = res.get("markdown") or ""
+        return md, md
 
 
 MATH_RE = re.compile(
@@ -281,7 +307,7 @@ def add_snapshot(md, eqs, dt):
 # ---------------------------------------------------------------- one-shot mode
 
 def make_ocr():
-    return MockOCR() if args.backend == "mock" else ChandraOCR(args.backend)
+    return MockOCR() if args.backend == "mock" else DatalabOCR()
 
 
 if args.once:
@@ -337,7 +363,9 @@ def api_state():
             "equations": state["equations"],
             "stats": {
                 "status": state["status"],
-                "backend": args.backend,
+                "backend": args.backend + ("/" + args.mode if args.backend == "datalab" else ""),
+                "pages_billed": state["pages_billed"],
+                "est_cost": round(state["est_cost"], 3),
                 "snapshots": state["snap_count"],
                 "skipped": state["skipped"],
                 "last_diff": state["last_diff"],
